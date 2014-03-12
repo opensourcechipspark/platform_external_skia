@@ -528,13 +528,18 @@ LOCAL_SRC_FILES += \
 	src/opts/opts_check_arm.cpp \
 	src/opts/memset.arm.S \
 	src/opts/SkBitmapProcState_opts_arm.cpp \
-	src/opts/SkBlitRow_opts_arm.cpp
-
+	src/opts/SkBlitRow_opts_arm.cpp \
+	src/opts/SkMorphology_opts_neon.cpp
 else
 LOCAL_SRC_FILES += \
 	src/opts/SkBlitRow_opts_none.cpp \
 	src/opts/SkBitmapProcState_opts_none.cpp \
-	src/opts/SkUtils_opts_none.cpp
+	src/opts/SkUtils_opts_none.cpp \
+	src/opts/SkMorphology_opts_none.cpp
+endif
+ifeq ($(ARCH_ARM_HAVE_NEON),true)
+	LOCAL_C_INCLUDES += \
+	$(LOCAL_PATH)/src/opts
 endif
 
 LOCAL_SHARED_LIBRARIES := \
@@ -555,7 +560,8 @@ LOCAL_STATIC_LIBRARIES := \
 	libwebp-decode \
 	libwebp-encode
 
-LOCAL_C_INCLUDES := \
+LOCAL_C_INCLUDES += \
+	$(LOCAL_PATH)/src/core \
 	$(LOCAL_PATH)/include/core \
 	$(LOCAL_PATH)/include/config \
 	$(LOCAL_PATH)/include/effects \
@@ -583,6 +589,22 @@ LOCAL_C_INCLUDES := \
 	external/webp/include \
 	frameworks/base/opengl/include \
 	external/expat/lib
+	
+#open this for test in the initial period of rk30
+#ifeq ($(TARGET_BOARD_HARDWARE), rk30board)
+#HAVE_LIBON2 := true
+#else
+#HAVE_LIBON2 := true 
+#true
+#endif
+
+#ifeq ($(HAVE_LIBON2), true)
+LOCAL_CFLAGS += -DUSE_HW_JPEG
+LOCAL_SRC_FILES += src/images/SkHwJpegUtility.cpp
+LOCAL_SHARED_LIBRARIES += libjpeghwdec
+LOCAL_C_INCLUDES += hardware/rk29/jpeghw/release/decoder_release \
+		hardware/rk29/libon2
+#endif
 
 LOCAL_EXPORT_C_INCLUDE_DIRS := \
 	$(LOCAL_PATH)/include/config \

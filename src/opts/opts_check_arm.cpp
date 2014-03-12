@@ -15,7 +15,8 @@
 
 #include "SkBlitRow.h"
 #include "SkUtils.h"
-
+#include "SkMorphology_opts.h"
+#include "SkMorphology_opts_neon.h"
 #include "SkUtilsArm.h"
 
 #if defined(SK_CPU_LENDIAN) && !SK_ARM_NEON_IS_NONE
@@ -64,4 +65,22 @@ SkMemset32Proc SkMemset32GetPlatformProc() {
 
 SkBlitRow::ColorRectProc PlatformColorRectProcFactory() {
     return NULL;
+}
+SkMorphologyProc SkMorphologyGetPlatformProc(SkMorphologyProcType type) {
+#if defined(__ARM_HAVE_NEON)
+    switch (type) {
+        case kDilateX_SkMorphologyProcType:
+            return SkDilateX_neon;
+        case kDilateY_SkMorphologyProcType:
+            return SkDilateY_neon;
+        case kErodeX_SkMorphologyProcType:
+            return SkErodeX_neon;
+        case kErodeY_SkMorphologyProcType:
+            return SkErodeY_neon;
+        default:
+            return NULL;
+    }
+#else 
+	return NULL;
+#endif
 }

@@ -15,7 +15,10 @@
         'effects.gypi',
       ],
       'include_dirs': [
+        '../include/config',
+        '../include/core',
         '../include/effects',
+        '../src/opts',
         '../src/core',
       ],
       'direct_dependent_settings': {

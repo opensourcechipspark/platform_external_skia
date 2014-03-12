@@ -14,6 +14,15 @@
 #include "SkString.h"
 
 SK_DEFINE_INST_COUNT(SkXfermode)
+#if defined(__ARM_HAVE_NEON)
+#include <arm_neon.h>
+
+
+#define NEON_A (SK_A32_SHIFT / 8)
+#define NEON_R (SK_R32_SHIFT / 8)
+#define NEON_G (SK_G32_SHIFT / 8)
+#define NEON_B (SK_B32_SHIFT / 8)
+#endif
 
 #define SkAlphaMulAlpha(a, b)   SkMulDiv255Round(a, b)
 
@@ -30,6 +39,138 @@ static U8CPU mulmuldiv255round(U8CPU a, U8CPU b, U8CPU c, U8CPU d) {
     SkASSERT(result <= 255);
     return result;
 }
+#endif
+#if defined(__ARM_HAVE_NEON)
+static inline uint16x8_t SkAlpha255To256_neon8(uint8x8_t alpha) {
+    return vaddw_u8(vdupq_n_u16(1), alpha);
+}
+
+static inline uint8x8_t SkAlphaMul_neon8(uint8x8_t color, uint16x8_t scale) {
+    return vshrn_n_u16(vmovl_u8(color) * scale, 8);
+}
+
+static inline uint8x8x4_t SkAlphaMulQ_neon8(uint8x8x4_t color, uint16x8_t scale) {
+    uint8x8x4_t ret;
+
+    ret.val[NEON_A] = SkAlphaMul_neon8(color.val[NEON_A], scale);
+    ret.val[NEON_R] = SkAlphaMul_neon8(color.val[NEON_R], scale);
+    ret.val[NEON_G] = SkAlphaMul_neon8(color.val[NEON_G], scale);
+    ret.val[NEON_B] = SkAlphaMul_neon8(color.val[NEON_B], scale);
+
+    return ret;
+}
+
+/* This function expands 8 pixels from RGB565 (R, G, B from high to low) to
+ * SkPMColor (all possible configurations supported) in the exact same way as
+ * SkPixel16ToPixel32.
+ */
+static inline uint8x8x4_t SkPixel16ToPixel32_neon8(uint16x8_t vsrc) {
+
+    uint8x8x4_t ret;
+    uint8x8_t vr, vg, vb;
+
+    vr = vmovn_u16(vshrq_n_u16(vsrc, SK_R16_SHIFT));
+    vg = vmovn_u16(vshrq_n_u16(vshlq_n_u16(vsrc, SK_R16_BITS), SK_R16_BITS + SK_B16_BITS));
+    vb = vmovn_u16(vsrc & vdupq_n_u16(SK_B16_MASK));
+
+    ret.val[NEON_A] = vdup_n_u8(0xFF);
+    ret.val[NEON_R] = vshl_n_u8(vr, 8 - SK_R16_BITS) | vshr_n_u8(vr, 2 * SK_R16_BITS - 8);
+    ret.val[NEON_G] = vshl_n_u8(vg, 8 - SK_G16_BITS) | vshr_n_u8(vg, 2 * SK_G16_BITS - 8);
+    ret.val[NEON_B] = vshl_n_u8(vb, 8 - SK_B16_BITS) | vshr_n_u8(vb, 2 * SK_B16_BITS - 8);
+
+    return ret;
+}
+
+/* This function packs 8 pixels from SkPMColor (all possible configurations
+ * supported) to RGB565 (R, G, B from high to low) in the exact same way as
+ * SkPixel32ToPixel16.
+ */
+static inline uint16x8_t SkPixel32ToPixel16_neon8(uint8x8x4_t vsrc) {
+
+    uint16x8_t ret;
+
+    ret = vshll_n_u8(vsrc.val[NEON_R], 8);
+    ret = vsriq_n_u16(ret, vshll_n_u8(vsrc.val[NEON_G], 8), SK_R16_BITS);
+    ret = vsriq_n_u16(ret, vshll_n_u8(vsrc.val[NEON_B], 8), SK_R16_BITS + SK_G16_BITS);
+
+    return ret;
+}
+static inline uint8x8_t SkDiv255Round_neon8_32_8(int32x4_t p1, int32x4_t p2) {
+    uint16x8_t tmp;
+
+    tmp = vcombine_u16(vmovn_u32(vreinterpretq_u32_s32(p1)),
+                       vmovn_u32(vreinterpretq_u32_s32(p2)));
+
+    tmp += vdupq_n_u16(128);
+    tmp += vshrq_n_u16(tmp, 8);
+
+    return vshrn_n_u16(tmp, 8);
+}
+static inline uint8x8_t clamp_div255round_simd8_32(int32x4_t val1, int32x4_t val2) {
+    uint8x8_t ret;
+    uint32x4_t cmp1, cmp2;
+    uint16x8_t cmp16;
+    uint8x8_t cmp8, cmp8_1;
+
+    // Test if <= 0
+    cmp1 = vcleq_s32(val1, vdupq_n_s32(0));
+    cmp2 = vcleq_s32(val2, vdupq_n_s32(0));
+    cmp16 = vcombine_u16(vmovn_u32(cmp1), vmovn_u32(cmp2));
+    cmp8_1 = vmovn_u16(cmp16);
+
+    // Init to zero
+    ret = vdup_n_u8(0);
+
+    // Test if >= 255*255
+    cmp1 = vcgeq_s32(val1, vdupq_n_s32(255*255));
+    cmp2 = vcgeq_s32(val2, vdupq_n_s32(255*255));
+    cmp16 = vcombine_u16(vmovn_u32(cmp1), vmovn_u32(cmp2));
+    cmp8 = vmovn_u16(cmp16);
+
+    // Insert 255 where true
+    ret = vbsl_u8(cmp8, vdup_n_u8(255), ret);
+
+    // Calc SkDiv255Round
+    uint8x8_t div = SkDiv255Round_neon8_32_8(val1, val2);
+
+    // Insert where false and previous test false
+    cmp8 = cmp8 | cmp8_1;
+    ret = vbsl_u8(cmp8, ret, div);
+
+    // Return the final combination
+    return ret;
+}
+static inline uint8x8_t SkAlphaMulAlpha_neon8(uint8x8_t color, uint8x8_t alpha) {
+    uint16x8_t tmp;
+    uint8x8_t ret;
+
+    tmp = vmull_u8(color, alpha);
+    tmp = vaddq_u16(tmp, vdupq_n_u16(128));
+    tmp = vaddq_u16(tmp, vshrq_n_u16(tmp, 8));
+
+    ret = vshrn_n_u16(tmp, 8);
+
+    return ret;
+}
+static inline uint8x8_t blendfunc_multiply_color(uint8x8_t sc, uint8x8_t dc,
+                                                 uint8x8_t sa, uint8x8_t da) {
+    uint32x4_t val1, val2;
+    uint16x8_t scdc, t1, t2;
+
+    t1 = vmull_u8(sc, vdup_n_u8(255) - da);
+    t2 = vmull_u8(dc, vdup_n_u8(255) - sa);
+    scdc = vmull_u8(sc, dc);
+
+    val1 = vaddl_u16(vget_low_u16(t1), vget_low_u16(t2));
+    val2 = vaddl_u16(vget_high_u16(t1), vget_high_u16(t2));
+
+    val1 = vaddw_u16(val1, vget_low_u16(scdc));
+    val2 = vaddw_u16(val2, vget_high_u16(scdc));
+
+    return clamp_div255round_simd8_32(
+                vreinterpretq_s32_u32(val1), vreinterpretq_s32_u32(val2));
+}
+
 #endif
 
 static inline unsigned saturated_add(unsigned a, unsigned b) {
@@ -102,31 +243,115 @@ static SkPMColor srcover_modeproc(SkPMColor src, SkPMColor dst) {
 static SkPMColor dstover_modeproc(SkPMColor src, SkPMColor dst) {
     // this is the reverse of srcover, just flipping src and dst
     // see srcover's comment about the 256 for opaqueness guarantees
-    return dst + SkAlphaMulQ(src, 256 - SkGetPackedA32(dst));
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+    uint16x8_t scale;
+    scale = vsubw_u8(vdupq_n_u16(256), dst_neon.val[NEON_A]);
+    ret.val[NEON_A] = dst_neon.val[NEON_A] + SkAlphaMul_neon8(src_neon.val[NEON_A], scale);
+    ret.val[NEON_R] = dst_neon.val[NEON_R] + SkAlphaMul_neon8(src_neon.val[NEON_R], scale);
+    ret.val[NEON_G] = dst_neon.val[NEON_G] + SkAlphaMul_neon8(src_neon.val[NEON_G], scale);
+    ret.val[NEON_B] = dst_neon.val[NEON_B] + SkAlphaMul_neon8(src_neon.val[NEON_B], scale);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);
+#else
+	return dst + SkAlphaMulQ(src, 256 - SkGetPackedA32(dst));
+#endif
 }
 
 //  kSrcIn_Mode,    //!< [Sa * Da, Sc * Da]
 static SkPMColor srcin_modeproc(SkPMColor src, SkPMColor dst) {
-    return SkAlphaMulQ(src, SkAlpha255To256(SkGetPackedA32(dst)));
+#if defined(__ARM_HAVE_NEON)
+	uint32_t result[1]={0};
+	uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+	uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+	uint8x8x4_t ret;
+    uint16x8_t scale;
+    scale = SkAlpha255To256_neon8(dst_neon.val[NEON_A]);
+    ret.val[NEON_A] =SkAlphaMul_neon8(src_neon.val[NEON_A], scale);
+    ret.val[NEON_R] =SkAlphaMul_neon8(src_neon.val[NEON_R], scale);
+    ret.val[NEON_G] =SkAlphaMul_neon8(src_neon.val[NEON_G], scale);
+    ret.val[NEON_B] =SkAlphaMul_neon8(src_neon.val[NEON_B], scale);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);
+#else
+	return SkAlphaMulQ(src, SkAlpha255To256(SkGetPackedA32(dst)));
+#endif
 }
 
 //  kDstIn_Mode,    //!< [Sa * Da, Sa * Dc]
 static SkPMColor dstin_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+    uint16x8_t scale;
+
+    scale = SkAlpha255To256_neon8(src_neon.val[NEON_A]);
+    ret = SkAlphaMulQ_neon8(dst_neon, scale);
+	
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);
+#else
     return SkAlphaMulQ(dst, SkAlpha255To256(SkGetPackedA32(src)));
+#endif
 }
 
 //  kSrcOut_Mode,   //!< [Sa * (1 - Da), Sc * (1 - Da)]
 static SkPMColor srcout_modeproc(SkPMColor src, SkPMColor dst) {
-    return SkAlphaMulQ(src, SkAlpha255To256(255 - SkGetPackedA32(dst)));
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+    uint16x8_t scale = vsubw_u8(vdupq_n_u16(256), dst_neon.val[NEON_A]);
+    ret = SkAlphaMulQ_neon8(src_neon, scale);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);
+#else
+	return SkAlphaMulQ(src, SkAlpha255To256(255 - SkGetPackedA32(dst)));
+#endif
 }
 
 //  kDstOut_Mode,   //!< [Da * (1 - Sa), Dc * (1 - Sa)]
 static SkPMColor dstout_modeproc(SkPMColor src, SkPMColor dst) {
-    return SkAlphaMulQ(dst, SkAlpha255To256(255 - SkGetPackedA32(src)));
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+    uint16x8_t scale = vsubw_u8(vdupq_n_u16(256), src_neon.val[NEON_A]);
+    ret = SkAlphaMulQ_neon8(dst_neon, scale);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);
+#else
+	return SkAlphaMulQ(dst, SkAlpha255To256(255 - SkGetPackedA32(src)));
+#endif
 }
 
 //  kSrcATop_Mode,  //!< [Da, Sc * Da + (1 - Sa) * Dc]
 static SkPMColor srcatop_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+    uint8x8_t isa;
+	
+    isa = vsub_u8(vdup_n_u8(255), src_neon.val[NEON_A]);
+    ret.val[NEON_A] = dst_neon.val[NEON_A];
+    ret.val[NEON_R] = SkAlphaMulAlpha_neon8(src_neon.val[NEON_R], dst_neon.val[NEON_A])
+                      + SkAlphaMulAlpha_neon8(dst_neon.val[NEON_R], isa);
+    ret.val[NEON_G] = SkAlphaMulAlpha_neon8(src_neon.val[NEON_G], dst_neon.val[NEON_A])
+                      + SkAlphaMulAlpha_neon8(dst_neon.val[NEON_G], isa);
+    ret.val[NEON_B] = SkAlphaMulAlpha_neon8(src_neon.val[NEON_B], dst_neon.val[NEON_A])
+                      + SkAlphaMulAlpha_neon8(dst_neon.val[NEON_B], isa);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);
+#else
     unsigned sa = SkGetPackedA32(src);
     unsigned da = SkGetPackedA32(dst);
     unsigned isa = 255 - sa;
@@ -138,10 +363,30 @@ static SkPMColor srcatop_modeproc(SkPMColor src, SkPMColor dst) {
                             SkAlphaMulAlpha(isa, SkGetPackedG32(dst)),
                         SkAlphaMulAlpha(da, SkGetPackedB32(src)) +
                             SkAlphaMulAlpha(isa, SkGetPackedB32(dst)));
+#endif
 }
 
 //  kDstATop_Mode,  //!< [Sa, Sa * Dc + Sc * (1 - Da)]
 static SkPMColor dstatop_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+    uint8x8_t isa;
+ 
+	isa = vsub_u8(vdup_n_u8(255), dst_neon.val[NEON_A]);
+
+    ret.val[NEON_A] = src_neon.val[NEON_A];
+    ret.val[NEON_R] = SkAlphaMulAlpha_neon8(src_neon.val[NEON_R], dst_neon.val[NEON_A])
+                      + SkAlphaMulAlpha_neon8(dst_neon.val[NEON_R], isa);
+    ret.val[NEON_G] = SkAlphaMulAlpha_neon8(src_neon.val[NEON_G], dst_neon.val[NEON_A])
+                      + SkAlphaMulAlpha_neon8(dst_neon.val[NEON_G], isa);
+    ret.val[NEON_B] = SkAlphaMulAlpha_neon8(src_neon.val[NEON_B], dst_neon.val[NEON_A])
+                      + SkAlphaMulAlpha_neon8(dst_neon.val[NEON_B], isa);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);
+#else
     unsigned sa = SkGetPackedA32(src);
     unsigned da = SkGetPackedA32(dst);
     unsigned ida = 255 - da;
@@ -153,10 +398,39 @@ static SkPMColor dstatop_modeproc(SkPMColor src, SkPMColor dst) {
                             SkAlphaMulAlpha(sa, SkGetPackedG32(dst)),
                         SkAlphaMulAlpha(ida, SkGetPackedB32(src)) +
                             SkAlphaMulAlpha(sa, SkGetPackedB32(dst)));
+#endif
 }
 
 //  kXor_Mode   [Sa + Da - 2 * Sa * Da, Sc * (1 - Da) + (1 - Sa) * Dc]
 static SkPMColor xor_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+    uint8x8_t isa, ida;
+    uint16x8_t tmp_wide, tmp_wide2;
+ 
+    isa = vsub_u8(vdup_n_u8(255), src_neon.val[NEON_A]);
+    ida = vsub_u8(vdup_n_u8(255), dst_neon.val[NEON_A]);
+
+    // First calc alpha
+    tmp_wide = vmovl_u8(src_neon.val[NEON_A]);
+    tmp_wide = vaddw_u8(tmp_wide, dst_neon.val[NEON_A]);
+    tmp_wide2 = vshll_n_u8(SkAlphaMulAlpha_neon8(src_neon.val[NEON_A], dst_neon.val[NEON_A]), 1);
+    tmp_wide = vsubq_u16(tmp_wide, tmp_wide2);
+    ret.val[NEON_A] = vmovn_u16(tmp_wide);
+
+    // Then colors
+    ret.val[NEON_R] = SkAlphaMulAlpha_neon8(src_neon.val[NEON_R], ida)
+                      + SkAlphaMulAlpha_neon8(dst_neon.val[NEON_R], isa);
+    ret.val[NEON_G] = SkAlphaMulAlpha_neon8(src_neon.val[NEON_G], ida)
+                      + SkAlphaMulAlpha_neon8(dst_neon.val[NEON_G], isa);
+    ret.val[NEON_B] = SkAlphaMulAlpha_neon8(src_neon.val[NEON_B], ida)
+                      + SkAlphaMulAlpha_neon8(dst_neon.val[NEON_B], isa);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);
+#else
     unsigned sa = SkGetPackedA32(src);
     unsigned da = SkGetPackedA32(dst);
     unsigned isa = 255 - sa;
@@ -169,17 +443,32 @@ static SkPMColor xor_modeproc(SkPMColor src, SkPMColor dst) {
                             SkAlphaMulAlpha(isa, SkGetPackedG32(dst)),
                         SkAlphaMulAlpha(ida, SkGetPackedB32(src)) +
                             SkAlphaMulAlpha(isa, SkGetPackedB32(dst)));
+#endif
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 
 // kPlus_Mode
 static SkPMColor plus_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+
+    ret.val[NEON_A] = vqadd_u8(src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_R] = vqadd_u8(src_neon.val[NEON_R], dst_neon.val[NEON_R]);
+    ret.val[NEON_G] = vqadd_u8(src_neon.val[NEON_G], dst_neon.val[NEON_G]);
+    ret.val[NEON_B] = vqadd_u8(src_neon.val[NEON_B], dst_neon.val[NEON_B]);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);
+#else
     unsigned b = saturated_add(SkGetPackedB32(src), SkGetPackedB32(dst));
     unsigned g = saturated_add(SkGetPackedG32(src), SkGetPackedG32(dst));
     unsigned r = saturated_add(SkGetPackedR32(src), SkGetPackedR32(dst));
     unsigned a = saturated_add(SkGetPackedA32(src), SkGetPackedA32(dst));
     return SkPackARGB32(a, r, g, b);
+#endif
 }
 
 // kModulate_Mode
@@ -190,38 +479,149 @@ static SkPMColor modulate_modeproc(SkPMColor src, SkPMColor dst) {
     int b = SkAlphaMulAlpha(SkGetPackedB32(src), SkGetPackedB32(dst));
     return SkPackARGB32(a, r, g, b);
 }
+#if defined(__ARM_HAVE_NEON)
+static inline uint16x8_t SkAlphaMulAlpha_neon8_16(uint8x8_t color, uint8x8_t alpha) {
+    uint16x8_t ret;
 
+    ret = vmull_u8(color, alpha);
+    ret = vaddq_u16(ret, vdupq_n_u16(128));
+    ret = vaddq_u16(ret, vshrq_n_u16(ret, 8));
+
+    ret = vshrq_n_u16(ret, 8);
+
+    return ret;
+}
+#endif
+#if defined(__ARM_HAVE_NEON)
+static inline uint8x8_t srcover_color(uint8x8_t a, uint8x8_t b) {
+    uint16x8_t tmp;
+
+    tmp = vaddl_u8(a, b);
+    tmp -= SkAlphaMulAlpha_neon8_16(a, b);
+
+    return vmovn_u16(tmp);
+}
+#endif
 static inline int srcover_byte(int a, int b) {
     return a + b - SkAlphaMulAlpha(a, b);
 }
-
-// kMultiply_Mode
-// B(Cb, Cs) = Cb x Cs
-// multiply uses its own version of blendfunc_byte because sa and da are not needed
-static int blendfunc_multiply_byte(int sc, int dc, int sa, int da) {
-    return clamp_div255round(sc * (255 - da)  + dc * (255 - sa)  + sc * dc);
-}
-
-static SkPMColor multiply_modeproc(SkPMColor src, SkPMColor dst) {
-    int sa = SkGetPackedA32(src);
-    int da = SkGetPackedA32(dst);
-    int a = srcover_byte(sa, da);
-    int r = blendfunc_multiply_byte(SkGetPackedR32(src), SkGetPackedR32(dst), sa, da);
-    int g = blendfunc_multiply_byte(SkGetPackedG32(src), SkGetPackedG32(dst), sa, da);
-    int b = blendfunc_multiply_byte(SkGetPackedB32(src), SkGetPackedB32(dst), sa, da);
-    return SkPackARGB32(a, r, g, b);
-}
-
 // kScreen_Mode
 static SkPMColor screen_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+
+    ret.val[NEON_A] = srcover_color(src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_R] = srcover_color(src_neon.val[NEON_R], dst_neon.val[NEON_R]);
+    ret.val[NEON_G] = srcover_color(src_neon.val[NEON_G], dst_neon.val[NEON_G]);
+    ret.val[NEON_B] = srcover_color(src_neon.val[NEON_B], dst_neon.val[NEON_B]);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);
+#else
     int a = srcover_byte(SkGetPackedA32(src), SkGetPackedA32(dst));
     int r = srcover_byte(SkGetPackedR32(src), SkGetPackedR32(dst));
     int g = srcover_byte(SkGetPackedG32(src), SkGetPackedG32(dst));
     int b = srcover_byte(SkGetPackedB32(src), SkGetPackedB32(dst));
     return SkPackARGB32(a, r, g, b);
+#endif
 }
 
 // kOverlay_Mode
+#if defined(__ARM_HAVE_NEON)
+template <bool overlay>
+static inline uint8x8_t overlay_hardlight_color(uint8x8_t sc, uint8x8_t dc,
+                                               uint8x8_t sa, uint8x8_t da) {
+    /*
+     * In the end we're gonna use (rc + tmp) with a different rc
+     * coming from an alternative.
+     * The whole value (rc + tmp) can always be expressed as
+     * VAL = COM - SUB in the if case
+     * VAL = COM + SUB - sa*da in the else case
+     *
+     * with COM = 255 * (sc + dc)
+     * and  SUB = sc*da + dc*sa - 2*dc*sc
+     */
+
+    // Prepare common subexpressions
+    uint16x8_t const255 = vdupq_n_u16(255);
+    uint16x8_t sc_plus_dc = vaddl_u8(sc, dc);
+    uint16x8_t scda = vmull_u8(sc, da);
+    uint16x8_t dcsa = vmull_u8(dc, sa);
+    uint16x8_t sada = vmull_u8(sa, da);
+
+    // Prepare non common subexpressions
+    uint16x8_t dc2, sc2;
+    uint32x4_t scdc2_1, scdc2_2;
+    if (overlay) {
+        dc2 = vshll_n_u8(dc, 1);
+        scdc2_1 = vmull_u16(vget_low_u16(dc2), vget_low_u16(vmovl_u8(sc)));
+        scdc2_2 = vmull_u16(vget_high_u16(dc2), vget_high_u16(vmovl_u8(sc)));
+    } else {
+        sc2 = vshll_n_u8(sc, 1);
+        scdc2_1 = vmull_u16(vget_low_u16(sc2), vget_low_u16(vmovl_u8(dc)));
+        scdc2_2 = vmull_u16(vget_high_u16(sc2), vget_high_u16(vmovl_u8(dc)));
+    }
+
+    // Calc COM
+    int32x4_t com1, com2;
+    com1 = vreinterpretq_s32_u32(
+                vmull_u16(vget_low_u16(const255), vget_low_u16(sc_plus_dc)));
+    com2 = vreinterpretq_s32_u32(
+                vmull_u16(vget_high_u16(const255), vget_high_u16(sc_plus_dc)));
+
+    // Calc SUB
+    int32x4_t sub1, sub2;
+    sub1 = vreinterpretq_s32_u32(vaddl_u16(vget_low_u16(scda), vget_low_u16(dcsa)));
+    sub2 = vreinterpretq_s32_u32(vaddl_u16(vget_high_u16(scda), vget_high_u16(dcsa)));
+    sub1 = vsubq_s32(sub1, vreinterpretq_s32_u32(scdc2_1));
+    sub2 = vsubq_s32(sub2, vreinterpretq_s32_u32(scdc2_2));
+
+    // Compare 2*dc <= da
+    uint16x8_t cmp;
+
+    if (overlay) {
+        cmp = vcleq_u16(dc2, vmovl_u8(da));
+    } else {
+        cmp = vcleq_u16(sc2, vmovl_u8(sa));
+    }
+
+    // Prepare variables
+    int32x4_t val1_1, val1_2;
+    int32x4_t val2_1, val2_2;
+    uint32x4_t cmp1, cmp2;
+
+    cmp1 = vmovl_u16(vget_low_u16(cmp));
+    cmp1 |= vshlq_n_u32(cmp1, 16);
+    cmp2 = vmovl_u16(vget_high_u16(cmp));
+    cmp2 |= vshlq_n_u32(cmp2, 16);
+
+    // Calc COM - SUB
+    val1_1 = com1 - sub1;
+    val1_2 = com2 - sub2;
+
+    // Calc COM + SUB - sa*da
+    val2_1 = com1 + sub1;
+    val2_2 = com2 + sub2;
+
+    val2_1 = vsubq_s32(val2_1, vreinterpretq_s32_u32(vmovl_u16(vget_low_u16(sada))));
+    val2_2 = vsubq_s32(val2_2, vreinterpretq_s32_u32(vmovl_u16(vget_high_u16(sada))));
+
+    // Insert where needed
+    val1_1 = vbslq_s32(cmp1, val1_1, val2_1);
+    val1_2 = vbslq_s32(cmp2, val1_2, val2_2);
+
+    // Call the clamp_div255round function
+    return clamp_div255round_simd8_32(val1_1, val1_2);
+}
+#endif
+#if defined(__ARM_HAVE_NEON)
+static inline uint8x8_t overlay_color(uint8x8_t sc, uint8x8_t dc,
+                                      uint8x8_t sa, uint8x8_t da) {
+    return overlay_hardlight_color<true>(sc, dc, sa, da);
+}
+#endif
 static inline int overlay_byte(int sc, int dc, int sa, int da) {
     int tmp = sc * (255 - da) + dc * (255 - sa);
     int rc;
@@ -233,6 +633,22 @@ static inline int overlay_byte(int sc, int dc, int sa, int da) {
     return clamp_div255round(rc + tmp);
 }
 static SkPMColor overlay_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+
+    ret.val[NEON_A] = srcover_color(src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_R] = overlay_color(src_neon.val[NEON_R], dst_neon.val[NEON_R],
+                                    src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_G] = overlay_color(src_neon.val[NEON_G], dst_neon.val[NEON_G],
+                                    src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_B] = overlay_color(src_neon.val[NEON_B], dst_neon.val[NEON_B],
+    	 							src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);                      
+#else 
     int sa = SkGetPackedA32(src);
     int da = SkGetPackedA32(dst);
     int a = srcover_byte(sa, da);
@@ -240,9 +656,55 @@ static SkPMColor overlay_modeproc(SkPMColor src, SkPMColor dst) {
     int g = overlay_byte(SkGetPackedG32(src), SkGetPackedG32(dst), sa, da);
     int b = overlay_byte(SkGetPackedB32(src), SkGetPackedB32(dst), sa, da);
     return SkPackARGB32(a, r, g, b);
+#endif
 }
 
 // kDarken_Mode
+#if defined(__ARM_HAVE_NEON)
+static inline uint16x8_t SkDiv255Round_neon8_16_16(uint16x8_t prod) {
+    prod += vdupq_n_u16(128);
+    prod += vshrq_n_u16(prod, 8);
+
+    return vshrq_n_u16(prod, 8);
+}
+template <bool lighten>
+static inline uint8x8_t lighten_darken_color(uint8x8_t sc, uint8x8_t dc,
+                                             uint8x8_t sa, uint8x8_t da) {
+    uint16x8_t sd, ds, cmp, tmp, tmp2;
+
+    // Prepare
+    sd = vmull_u8(sc, da);
+    ds = vmull_u8(dc, sa);
+
+    // Do test
+    if (lighten) {
+        cmp = vcgtq_u16(sd, ds);
+    } else {
+        cmp = vcltq_u16(sd, ds);
+    }
+
+    // Assign if
+    tmp = vaddl_u8(sc, dc);
+    tmp2 = tmp;
+    tmp -= SkDiv255Round_neon8_16_16(ds);
+
+    // Calc else
+    tmp2 -= SkDiv255Round_neon8_16_16(sd);
+
+    // Insert where needed
+    tmp = vbslq_u16(cmp, tmp, tmp2);
+
+    return vmovn_u16(tmp);
+}
+static inline uint8x8_t darken_color(uint8x8_t sc, uint8x8_t dc,
+                                     uint8x8_t sa, uint8x8_t da) {
+    return lighten_darken_color<false>(sc, dc, sa, da);
+}
+static inline uint8x8_t lighten_color(uint8x8_t sc, uint8x8_t dc,
+                                      uint8x8_t sa, uint8x8_t da) {
+    return lighten_darken_color<true>(sc, dc, sa, da);
+}
+#endif
 static inline int darken_byte(int sc, int dc, int sa, int da) {
     int sd = sc * da;
     int ds = dc * sa;
@@ -255,6 +717,22 @@ static inline int darken_byte(int sc, int dc, int sa, int da) {
     }
 }
 static SkPMColor darken_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+
+    ret.val[NEON_A] = srcover_color(src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_R] = darken_color(src_neon.val[NEON_R], dst_neon.val[NEON_R],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_G] = darken_color(src_neon.val[NEON_G], dst_neon.val[NEON_G],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_B] = darken_color(src_neon.val[NEON_B], dst_neon.val[NEON_B],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);    
+#else
     int sa = SkGetPackedA32(src);
     int da = SkGetPackedA32(dst);
     int a = srcover_byte(sa, da);
@@ -262,6 +740,7 @@ static SkPMColor darken_modeproc(SkPMColor src, SkPMColor dst) {
     int g = darken_byte(SkGetPackedG32(src), SkGetPackedG32(dst), sa, da);
     int b = darken_byte(SkGetPackedB32(src), SkGetPackedB32(dst), sa, da);
     return SkPackARGB32(a, r, g, b);
+#endif
 }
 
 // kLighten_Mode
@@ -277,6 +756,22 @@ static inline int lighten_byte(int sc, int dc, int sa, int da) {
     }
 }
 static SkPMColor lighten_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+
+    ret.val[NEON_A] = srcover_color(src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_R] = lighten_color(src_neon.val[NEON_R], dst_neon.val[NEON_R],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_G] = lighten_color(src_neon.val[NEON_G], dst_neon.val[NEON_G],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_B] = lighten_color(src_neon.val[NEON_B], dst_neon.val[NEON_B],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);   
+#else
     int sa = SkGetPackedA32(src);
     int da = SkGetPackedA32(dst);
     int a = srcover_byte(sa, da);
@@ -284,6 +779,7 @@ static SkPMColor lighten_modeproc(SkPMColor src, SkPMColor dst) {
     int g = lighten_byte(SkGetPackedG32(src), SkGetPackedG32(dst), sa, da);
     int b = lighten_byte(SkGetPackedB32(src), SkGetPackedB32(dst), sa, da);
     return SkPackARGB32(a, r, g, b);
+#endif
 }
 
 // kColorDodge_Mode
@@ -344,7 +840,29 @@ static inline int hardlight_byte(int sc, int dc, int sa, int da) {
     }
     return clamp_div255round(rc + sc * (255 - da) + dc * (255 - sa));
 }
+#if defined(__ARM_HAVE_NEON)
+static inline uint8x8_t hardlight_color(uint8x8_t sc, uint8x8_t dc,
+                                        uint8x8_t sa, uint8x8_t da) {
+    return overlay_hardlight_color<false>(sc, dc, sa, da);
+}
+#endif
 static SkPMColor hardlight_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+
+    ret.val[NEON_A] = srcover_color(src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_R] = hardlight_color(src_neon.val[NEON_R], dst_neon.val[NEON_R],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_G] = hardlight_color(src_neon.val[NEON_G], dst_neon.val[NEON_G],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_B] = hardlight_color(src_neon.val[NEON_B], dst_neon.val[NEON_B],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);    
+#else 
     int sa = SkGetPackedA32(src);
     int da = SkGetPackedA32(dst);
     int a = srcover_byte(sa, da);
@@ -352,6 +870,7 @@ static SkPMColor hardlight_modeproc(SkPMColor src, SkPMColor dst) {
     int g = hardlight_byte(SkGetPackedG32(src), SkGetPackedG32(dst), sa, da);
     int b = hardlight_byte(SkGetPackedB32(src), SkGetPackedB32(dst), sa, da);
     return SkPackARGB32(a, r, g, b);
+#endif
 }
 
 // returns 255 * sqrt(n/255)
@@ -389,7 +908,46 @@ static inline int difference_byte(int sc, int dc, int sa, int da) {
     int tmp = SkMin32(sc * da, dc * sa);
     return clamp_signed_byte(sc + dc - 2 * SkDiv255Round(tmp));
 }
+#if defined(__ARM_HAVE_NEON)
+static inline uint8x8_t difference_color(uint8x8_t sc, uint8x8_t dc,
+                                         uint8x8_t sa, uint8x8_t da) {
+    uint16x8_t sd, ds, tmp;
+    int16x8_t val;
+
+    sd = vmull_u8(sc, da);
+    ds = vmull_u8(dc, sa);
+
+    tmp = vminq_u16(sd, ds);
+    tmp = SkDiv255Round_neon8_16_16(tmp);
+    tmp = vshlq_n_u16(tmp, 1);
+
+    val = vreinterpretq_s16_u16(vaddl_u8(sc, dc));
+
+    val -= vreinterpretq_s16_u16(tmp);
+
+    val = vmaxq_s16(val, vdupq_n_s16(0));
+    val = vminq_s16(val, vdupq_n_s16(255));
+
+    return vmovn_u16(vreinterpretq_u16_s16(val));
+}
+#endif
 static SkPMColor difference_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+
+    ret.val[NEON_A] = srcover_color(src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_R] = difference_color(src_neon.val[NEON_R], dst_neon.val[NEON_R],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_G] = difference_color(src_neon.val[NEON_G], dst_neon.val[NEON_G],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_B] = difference_color(src_neon.val[NEON_B], dst_neon.val[NEON_B],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);  
+#else
     int sa = SkGetPackedA32(src);
     int da = SkGetPackedA32(dst);
     int a = srcover_byte(sa, da);
@@ -397,18 +955,62 @@ static SkPMColor difference_modeproc(SkPMColor src, SkPMColor dst) {
     int g = difference_byte(SkGetPackedG32(src), SkGetPackedG32(dst), sa, da);
     int b = difference_byte(SkGetPackedB32(src), SkGetPackedB32(dst), sa, da);
     return SkPackARGB32(a, r, g, b);
+#endif
 }
 
 // kExclusion_Mode
-static inline int exclusion_byte(int sc, int dc, int, int) {
-    // this equations is wacky, wait for SVG to confirm it
-    //int r = sc * da + dc * sa - 2 * sc * dc + sc * (255 - da) + dc * (255 - sa);
 
-    // The above equation can be simplified as follows
-    int r = 255*(sc + dc) - 2 * sc * dc;
+
+static inline int exclusion_byte(int sc, int dc, int sa, int da) {
+    // this equations is wacky, wait for SVG to confirm it
+    int r = sc * da + dc * sa - 2 * sc * dc + sc * (255 - da) + dc * (255 - sa);
     return clamp_div255round(r);
 }
+#if defined(__ARM_HAVE_NEON)
+static inline uint8x8_t exclusion_color(uint8x8_t sc, uint8x8_t dc,
+                                        uint8x8_t sa, uint8x8_t da) {
+    /* The equation can be simplified to 255(sc + dc) - 2 * sc * dc */
+
+    uint16x8_t sc_plus_dc, scdc, const255;
+    int32x4_t term1_1, term1_2, term2_1, term2_2;
+
+    /* Calc (sc + dc) and (sc * dc) */
+    sc_plus_dc = vaddl_u8(sc, dc);
+    scdc = vmull_u8(sc, dc);
+
+    /* Prepare constants */
+    const255 = vdupq_n_u16(255);
+
+    /* Calc the first term */
+    term1_1 = vreinterpretq_s32_u32(
+                vmull_u16(vget_low_u16(const255), vget_low_u16(sc_plus_dc)));
+    term1_2 = vreinterpretq_s32_u32(
+                vmull_u16(vget_high_u16(const255), vget_high_u16(sc_plus_dc)));
+
+    /* Calc the second term */
+    term2_1 = vreinterpretq_s32_u32(vshll_n_u16(vget_low_u16(scdc), 1));
+    term2_2 = vreinterpretq_s32_u32(vshll_n_u16(vget_high_u16(scdc), 1));
+
+    return clamp_div255round_simd8_32(term1_1 - term2_1, term1_2 - term2_2);
+}
+#endif
 static SkPMColor exclusion_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+
+    ret.val[NEON_A] = srcover_color(src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_R] = exclusion_color(src_neon.val[NEON_R], dst_neon.val[NEON_R],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_G] = exclusion_color(src_neon.val[NEON_G], dst_neon.val[NEON_G],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_B] = exclusion_color(src_neon.val[NEON_B], dst_neon.val[NEON_B],
+                                      src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result);    
+#else
     int sa = SkGetPackedA32(src);
     int da = SkGetPackedA32(dst);
     int a = srcover_byte(sa, da);
@@ -416,6 +1018,32 @@ static SkPMColor exclusion_modeproc(SkPMColor src, SkPMColor dst) {
     int g = exclusion_byte(SkGetPackedG32(src), SkGetPackedG32(dst), sa, da);
     int b = exclusion_byte(SkGetPackedB32(src), SkGetPackedB32(dst), sa, da);
     return SkPackARGB32(a, r, g, b);
+#endif
+}
+// kMultiply_Mode
+static SkPMColor multiply_modeproc(SkPMColor src, SkPMColor dst) {
+#if defined(__ARM_HAVE_NEON)
+    uint32_t result[1]={0};
+    uint8x8x4_t src_neon = vld4_u8((uint8_t*)&src);//uint32_t * -> uint8_t* -> uint8x8x4_t
+    uint8x8x4_t dst_neon = vld4_u8((uint8_t*)&dst);
+    uint8x8x4_t ret;
+
+    ret.val[NEON_A] = srcover_color(src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_R] = blendfunc_multiply_color(src_neon.val[NEON_R], dst_neon.val[NEON_R],
+                                               src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_G] = blendfunc_multiply_color(src_neon.val[NEON_G], dst_neon.val[NEON_G],
+                                               src_neon.val[NEON_A], dst_neon.val[NEON_A]);
+    ret.val[NEON_B] = blendfunc_multiply_color(src_neon.val[NEON_B], dst_neon.val[NEON_B],
+                                               src_neon.val[NEON_A], dst_neon.val[NEON_A]);    
+    vst4_u8((uint8_t *)result,ret);//uint8x8x4_t -> uint8_t * -> uint32_t *
+    return (*result); 
+#else
+    int a = SkAlphaMulAlpha(SkGetPackedA32(src), SkGetPackedA32(dst));
+    int r = SkAlphaMulAlpha(SkGetPackedR32(src), SkGetPackedR32(dst));
+    int g = SkAlphaMulAlpha(SkGetPackedG32(src), SkGetPackedG32(dst));
+    int b = SkAlphaMulAlpha(SkGetPackedB32(src), SkGetPackedB32(dst));
+    return SkPackARGB32(a, r, g, b);
+#endif
 }
 
 // The CSS compositing spec introduces the following formulas:
@@ -705,6 +1333,7 @@ SkPMColor SkXfermode::xferColor(SkPMColor src, SkPMColor dst) const{
     return dst;
 }
 
+typedef uint8x8x4_t (*SkXfermodeProcSIMD)(uint8x8x4_t src, uint8x8x4_t dst);
 void SkXfermode::xfer32(SkPMColor* SK_RESTRICT dst,
                         const SkPMColor* SK_RESTRICT src, int count,
                         const SkAlpha* SK_RESTRICT aa) const {

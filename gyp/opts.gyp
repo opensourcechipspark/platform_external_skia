@@ -27,6 +27,8 @@
         'core.gyp:*',
       ],
       'include_dirs': [
+        '../include/config',
+        '../include/core',
         '../src/core',
         '../src/opts',
       ],
@@ -75,6 +77,8 @@
             '../src/opts/SkBitmapProcState_opts_arm.cpp',
             '../src/opts/SkBlitRow_opts_arm.cpp',
             '../src/opts/SkBlitRow_opts_arm.h',
+	    '../src/opts/SkMorphology_opts.h',
+	    '../src/opts/SkMorphology_opts_neon.cpp',
           ],
           'conditions': [
             [ 'arm_neon == 1 or arm_neon_optional == 1', {
@@ -96,6 +100,7 @@
           'sources': [
             '../src/opts/SkBitmapProcState_opts_none.cpp',
             '../src/opts/SkBlitRow_opts_none.cpp',
+            '../src/opts/SkMorphology_opts_none.cpp',
             '../src/opts/SkUtils_opts_none.cpp',
           ],
         }],
@@ -168,6 +173,8 @@
         '../src/opts/SkBitmapProcState_matrix_clamp_neon.h',
         '../src/opts/SkBitmapProcState_matrix_repeat_neon.h',
         '../src/opts/SkBlitRow_opts_arm_neon.cpp',
+	'../src/opts/SkMorphology_opts.h',
+      	'../src/opts/SkMorphology_opts_neon.cpp',
       ],
     },
   ],

@@ -9,6 +9,9 @@
 #include "SkImageDecoder.h"
 #include "SkImageEncoder.h"
 #include "SkJpegUtility.h"
+#ifdef USE_HW_JPEG
+#include "SkHwJpegUtility.h"
+#endif
 #include "SkColorPriv.h"
 #include "SkDither.h"
 #include "SkScaledBitmapSampler.h"
@@ -442,11 +445,200 @@ static void adjust_out_color_space_and_dither(jpeg_decompress_struct* cinfo,
 }
 #endif
 
-bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
-#ifdef TIME_DECODE
-    SkAutoTime atm("JPEG Decode");
+#define RELEASE_STREAM	do{	\
+						if(vpuStream != NULL){	\
+							delete vpuStream;	\
+						}	\
+						if(thumbPmem.reuse){	\
+							hw_jpeg_VPUFreeLinear(&thumbPmem.thumbpmem);	\
+						}	\
+						}while(false)
+						
+#ifdef USE_HW_JPEG
+#define MAX_HARDWARE_SUPPORT_INPUT_SIZE ((1<<24)-1)//the same to vpu
 #endif
 
+bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
+    //SkDebugf("JPEG Decode!");
+#if defined(TIME_DECODE) || defined(DEBUG_HW_JPEG)
+    AutoTimeMillis atm("JPEG Decode");
+#endif
+#ifdef USE_HW_JPEG
+	SkStream *thumbStream = NULL;
+	SkJpegVPUMemStream *vpuStream = NULL;
+	ReusePmem thumbPmem; //if hw decode thumbnail, reuse the thumb data in pmem, do not malloc vm
+	thumbPmem.reuse = 0;
+	AutoScaleBitmap thumbBitmap;   
+	//SkDebugf("JPEG HW Decode!");
+do{
+		SkBitmap::Config config = this->getPrefConfig(k32Bit_SrcDepth, false);
+		if (config != SkBitmap::kARGB_8888_Config &&
+        config != SkBitmap::kARGB_4444_Config &&
+        config != SkBitmap::kRGB_565_Config) {
+        config = SkBitmap::kARGB_8888_Config;
+    	}
+		if (config == SkBitmap::kARGB_4444_Config){
+			WHLOG("out config: %d, is not support by hw.",config);
+			break;
+		}
+		size_t streamlen = stream->getLength();
+		if(streamlen > MAX_HARDWARE_SUPPORT_INPUT_SIZE){
+			WHLOG("input size is so large for hardware, jump to software at once.");
+			break;
+		}
+		if (SkImageDecoder::kDecodeBounds_Mode != mode) {
+        	//use hardvpu mem sometimes when it is not decodeBounds_Mode
+			bool markSupport = stream->markSupport();
+			WHLOG("markSupport: %d", markSupport);
+			if(markSupport){//only markSupport and not justcalwh
+#ifdef WH_DEBUG_JPEG
+				AutoTimeMillis atm("JPEG read stream.");
+#endif
+				//should change to mark a new value for stream?
+				vpuStream = new SkJpegVPUMemStream(stream, &streamlen);
+				if(vpuStream->getLength() <= 0){
+					WHLOG("VPU STREAM LENGTH less than ZERO!");
+					break;		
+				}
+				stream = vpuStream;
+			}
+		}
+		HwJpegInputInfo hwInfo;
+		HwJpegOutputInfo outInfo;
+		hwInfo.justcaloutwh = SkImageDecoder::kDecodeBounds_Mode != mode? 0:1;
+		outInfo.thumbPmem = &thumbPmem;
+		int pixelBytes = -1;
+		sk_hw_jpeg_source_mgr sk_hw_stream(stream,this,&hwInfo,vpuStream != NULL);
+		hwInfo.streamCtl.inStream = &sk_hw_stream;
+		hwInfo.streamCtl.wholeStreamLength = streamlen;// > 64M? break;
+		WHLOG("Stream length: %d", hwInfo.streamCtl.wholeStreamLength);
+		hwInfo.streamCtl.thumbOffset = -1;
+		hwInfo.streamCtl.thumbLength = -1;
+		hwInfo.streamCtl.useThumb = 0;
+		PostProcessInfo * ppInfo = &hwInfo.ppInfo;
+		// only these make sense for jpegs
+    	if (config == SkBitmap::kARGB_8888_Config) {
+        	ppInfo->outFomart = 1;
+			ppInfo->shouldDither = 0;
+			pixelBytes = 4;
+    	} else if (config == SkBitmap::kRGB_565_Config) {
+        	ppInfo->outFomart = 0;
+        	ppInfo->shouldDither = this->getDitherImage();
+			pixelBytes = 2;
+    	}
+		ppInfo->scale_denom = this->getSampleSize();
+		//SkDebugf("SCALE DENOM : %d, out config: %d", ppInfo->scale_denom, config);
+		ppInfo->cropX = 0;
+		ppInfo->cropY = 0;
+  		ppInfo->cropW = -1;
+  		ppInfo->cropH = -1;
+		bm->lockPixels();
+        JSAMPLE* rowptr = (JSAMPLE*)bm->getPixels();
+	//SkDebugf("rowptr: %p, bm : %p", rowptr, bm);
+        bm->unlockPixels();
+        char reuseBitmap = (rowptr != NULL)?1:0;
+		if(reuseBitmap > 0 && config != bm->getConfig()){
+			//SkDebugf("bitmap is not null, but its config is not according with require.");
+		}
+		if(hw_jpeg_decode(&hwInfo,&outInfo, &reuseBitmap, bm->width(), bm->height()) >= 0){
+			if(reuseBitmap < 0){
+			    //SkDebugf("REUSE BITMAP FAILED.");
+				if(vpuStream != NULL){
+					delete vpuStream;
+				}
+				return false;
+			}			
+			//SkDebugf("GO HARD DECODE, OUT WH: %d,%d", outInfo.outWidth,outInfo.outHeight);
+			if(!reuseBitmap){
+				bm->setConfig(config,outInfo.outWidth,outInfo.outHeight);
+                                bm->setIsOpaque(true);
+			}
+			if(hwInfo.justcaloutwh == 0){
+				if(reuseBitmap == 0){
+					if(!this->allocPixelRef(bm,NULL)){
+						if(vpuStream != NULL){
+							delete vpuStream;
+						}
+						return false;
+					}					
+				}
+				//bm->lockPixels();
+				SkAutoLockPixels alp(*bm);
+				INT32 const bpr = bm->rowBytes();
+				int height = 0;
+				JSAMPLE * rowptr = (JSAMPLE*)bm->getPixels();
+				char *srcAddr = outInfo.outAddr;
+				//SkDebugf("bpr: %d, rowptr: %x, srcAddr: %x, reuseBitmap: %d\n",bpr, rowptr, srcAddr, reuseBitmap);
+				//WHLOG("bpr: %d, rowptr: %x, srcAddr: %x",bpr, rowptr, srcAddr);
+				while(height < outInfo.outHeight){
+					memcpy(rowptr, srcAddr, bpr);
+					rowptr += bpr;
+					srcAddr += outInfo.ppscalew * pixelBytes;
+					height++;
+				}
+				if(reuseBitmap > 0){
+					bm->notifyPixelsChanged();
+				}
+				hw_jpeg_release(outInfo.decoderHandle);
+				if(vpuStream != NULL){
+					delete vpuStream;
+				}
+				//bm->unlockPixels();
+			}
+			//when just cal out wh, if next hardware error occurs, may have problem also, FIX this in future
+			return true;
+		} else {
+			if(hwInfo.justcaloutwh == 1){
+				//SkDebugf("should not go to here.");
+				break;
+			}
+			hw_jpeg_release(outInfo.decoderHandle);
+			if (this->shouldCancelDecode() || reuseBitmap < 0) {
+				if(vpuStream != NULL){
+					delete vpuStream;
+				}
+                return false;
+            }
+			if(hwInfo.streamCtl.useThumb && hwInfo.streamCtl.thumbLength > 0){
+				//construct thumb source stream
+				if(thumbPmem.reuse){
+					//SkDebugf("use thumbnail data in pmem to soft decode.");
+					thumbStream = new SkMemoryStream(thumbPmem.thumbpmem.vir_addr, hwInfo.streamCtl.thumbLength, false);
+				}else{
+					//SkDebugf("use virtual mem to copy thumbnail data to soft decode.");
+					thumbStream = new SkMemoryStream(hwInfo.streamCtl.thumbLength);
+					if(sk_fill_thumb(&hwInfo, (void*)thumbStream->getMemoryBase()) > 0) {
+						//SkDebugf("sk_fiil_thumb_ok\n");
+					} else {
+						//SkDebugf("sk_fiil_thumb_bad\n");
+						delete thumbStream;
+						thumbStream =  NULL;
+					}
+				}
+				if(thumbStream != NULL){
+					stream = thumbStream;
+					this->setSampleSize(hwInfo.ppInfo.scale_denom);//set new sample size
+					if(outInfo.shouldScale)
+					{
+						thumbBitmap.setSourceAndFinalWH(reuseBitmap, outInfo.outWidth, outInfo.outHeight, bm, this);
+						bm = &thumbBitmap;
+					}
+					if(vpuStream != NULL){
+						delete vpuStream;
+						vpuStream = NULL;
+					}
+				}
+			} else {
+				//use base image
+				if(vpuStream != NULL && vpuStream->bytesInStream <= 0){
+					stream = vpuStream->baseStream;
+					delete vpuStream;
+					vpuStream = NULL;
+				}
+			}
+		}
+}while(0);
+#endif
     JPEGAutoClean autoClean;
 
     jpeg_decompress_struct  cinfo;
@@ -458,6 +650,9 @@ bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
     // All objects need to be instantiated before this setjmp call so that
     // they will be cleaned up properly if an error occurs.
     if (setjmp(errorManager.fJmpBuf)) {
+	#ifdef USE_HW_JPEG
+	   RELEASE_STREAM;
+	#endif
         return return_false(cinfo, *bm, "setjmp");
     }
 
@@ -466,6 +661,9 @@ bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
 
     int status = jpeg_read_header(&cinfo, true);
     if (status != JPEG_HEADER_OK) {
+	#ifdef USE_HW_JPEG
+	   RELEASE_STREAM;
+	#endif
         return return_false(cinfo, *bm, "read_header");
     }
 
@@ -491,6 +689,9 @@ bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
     if (1 == sampleSize && SkImageDecoder::kDecodeBounds_Mode == mode) {
         bm->setConfig(config, cinfo.image_width, cinfo.image_height);
         bm->setIsOpaque(config != SkBitmap::kA8_Config);
+	#ifdef USE_HW_JPEG
+	    RELEASE_STREAM;
+	#endif
         return true;
     }
 
@@ -513,8 +714,14 @@ bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
                                        recompute_sampleSize(sampleSize, cinfo));
             bm->setConfig(config, smpl.scaledWidth(), smpl.scaledHeight());
             bm->setIsOpaque(config != SkBitmap::kA8_Config);
+	    #ifdef USE_HW_JPEG
+	        RELEASE_STREAM;
+	    #endif
             return true;
         } else {
+	    #ifdef USE_HW_JPEG
+	        RELEASE_STREAM;
+	    #endif
             return return_false(cinfo, *bm, "start_decompress");
         }
     }
@@ -522,16 +729,24 @@ bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
 
     // should we allow the Chooser (if present) to pick a config for us???
     if (!this->chooseFromOneChoice(config, cinfo.output_width, cinfo.output_height)) {
+	#ifdef USE_HW_JPEG
+	    RELEASE_STREAM;
+	#endif
         return return_false(cinfo, *bm, "chooseFromOneChoice");
     }
-
     SkScaledBitmapSampler sampler(cinfo.output_width, cinfo.output_height, sampleSize);
     bm->setConfig(config, sampler.scaledWidth(), sampler.scaledHeight());
     bm->setIsOpaque(config != SkBitmap::kA8_Config);
     if (SkImageDecoder::kDecodeBounds_Mode == mode) {
+	#ifdef USE_HW_JPEG
+	    RELEASE_STREAM;
+	#endif
         return true;
     }
     if (!this->allocPixelRef(bm, NULL)) {
+	#ifdef USE_HW_JPEG
+	    RELEASE_STREAM;
+	#endif
         return return_false(cinfo, *bm, "allocPixelRef");
     }
 
@@ -555,14 +770,23 @@ bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
             // if row_count == 0, then we didn't get a scanline, so abort.
             // if we supported partial images, we might return true in this case
             if (0 == row_count) {
+		#ifdef USE_HW_JPEG
+		    RELEASE_STREAM;
+		#endif
                 return return_false(cinfo, *bm, "read_scanlines");
             }
             if (this->shouldCancelDecode()) {
+		#ifdef USE_HW_JPEG
+			RELEASE_STREAM;
+		#endif
                 return return_false(cinfo, *bm, "shouldCancelDecode");
             }
             rowptr += bpr;
         }
         jpeg_finish_decompress(&cinfo);
+	#ifdef USE_HW_JPEG
+	    RELEASE_STREAM;
+	#endif
         return true;
     }
 #endif
@@ -584,10 +808,16 @@ bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
                JCS_GRAYSCALE == cinfo.out_color_space) {
         sc = SkScaledBitmapSampler::kGray;
     } else {
+	#ifdef USE_HW_JPEG
+            RELEASE_STREAM;
+	#endif
         return return_false(cinfo, *bm, "jpeg colorspace");
     }
 
     if (!sampler.begin(bm, sc, *this)) {
+	#ifdef USE_HW_JPEG
+	    RELEASE_STREAM;
+	#endif
         return return_false(cinfo, *bm, "sampler.begin");
     }
 
@@ -597,6 +827,9 @@ bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
 
     //  Possibly skip initial rows [sampler.srcY0]
     if (!skip_src_rows(&cinfo, srcRow, sampler.srcY0())) {
+	#ifdef USE_HW_JPEG
+	    RELEASE_STREAM;
+	#endif
         return return_false(cinfo, *bm, "skip rows");
     }
 
@@ -605,9 +838,15 @@ bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
         JSAMPLE* rowptr = (JSAMPLE*)srcRow;
         int row_count = jpeg_read_scanlines(&cinfo, &rowptr, 1);
         if (0 == row_count) {
+	    #ifdef USE_HW_JPEG
+	        RELEASE_STREAM;
+	    #endif
             return return_false(cinfo, *bm, "read_scanlines");
         }
         if (this->shouldCancelDecode()) {
+            #ifdef USE_HW_JPEG
+	        RELEASE_STREAM;
+	    #endif
             return return_false(cinfo, *bm, "shouldCancelDecode");
         }
 
@@ -622,6 +861,9 @@ bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
         }
 
         if (!skip_src_rows(&cinfo, srcRow, sampler.srcDY() - 1)) {
+	    #ifdef USE_HW_JPEG
+		RELEASE_STREAM;
+	    #endif
             return return_false(cinfo, *bm, "skip rows");
         }
     }
@@ -629,10 +871,17 @@ bool SkJPEGImageDecoder::onDecode(SkStream* stream, SkBitmap* bm, Mode mode) {
     // we formally skip the rest, so we don't get a complaint from libjpeg
     if (!skip_src_rows(&cinfo, srcRow,
                        cinfo.output_height - cinfo.output_scanline)) {
+	#ifdef USE_HW_JPEG
+	    RELEASE_STREAM;
+	#endif
         return return_false(cinfo, *bm, "skip rows");
     }
     jpeg_finish_decompress(&cinfo);
 
+//    SkDebugf("------------------- bm2 size %d [%d %d] %d\n", bm->getSize(), bm->width(), bm->height(), bm->config());
+	#ifdef USE_HW_JPEG
+	   RELEASE_STREAM;
+	#endif
     return true;
 }
 

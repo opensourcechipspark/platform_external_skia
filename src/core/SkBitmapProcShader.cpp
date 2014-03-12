@@ -147,7 +147,7 @@ void SkBitmapProcShader::endContext() {
     this->INHERITED::endContext();
 }
 
-#define BUF_MAX     128
+#define BUF_MAX     1024
 
 #define TEST_BUFFER_OVERRITEx
 

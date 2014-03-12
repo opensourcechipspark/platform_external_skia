@@ -10,6 +10,7 @@
 #include "SkColorPriv.h"
 #include "SkFlattenableBuffers.h"
 #include "SkRect.h"
+#include "SkMorphology_opts.h"
 #if SK_SUPPORT_GPU
 #include "GrContext.h"
 #include "GrTexture.h"
@@ -37,13 +38,20 @@ void SkMorphologyImageFilter::flatten(SkFlattenableWriteBuffer& buffer) const {
     buffer.writeInt(fRadius.fHeight);
 }
 
+
+enum MorphDirection {
+    kX, kY
+};
+template<MorphDirection direction>
 static void erode(const SkPMColor* src, SkPMColor* dst,
-                  int radius, int width, int height,
-                  int srcStrideX, int srcStrideY,
-                  int dstStrideX, int dstStrideY)
+                   int radius, int width, int height,
+                  int srcStride, int dstStride)
 {
-    radius = SkMin32(radius, width - 1);
-    const SkPMColor* upperSrc = src + radius * srcStrideX;
+    const int srcStrideX = direction == kX ? 1 : srcStride;
+    const int dstStrideX = direction == kX ? 1 : dstStride;
+    const int srcStrideY = direction == kX ? srcStride : 1;
+    const int dstStrideY = direction == kX ? dstStride : 1;
+    const SkPMColor* upperSrc = src + SkMin32(radius, width - 1) * srcStrideX;
     for (int x = 0; x < width; ++x) {
         const SkPMColor* lp = src;
         const SkPMColor* up = upperSrc;
@@ -73,25 +81,36 @@ static void erode(const SkPMColor* src, SkPMColor* dst,
 
 static void erodeX(const SkBitmap& src, SkBitmap* dst, int radiusX)
 {
-    erode(src.getAddr32(0, 0), dst->getAddr32(0, 0),
-          radiusX, src.width(), src.height(),
-          1, src.rowBytesAsPixels(), 1, dst->rowBytesAsPixels());
+    SkMorphologyProc erodeXProc = SkMorphologyGetPlatformProc(kErodeX_SkMorphologyProcType);
+    if (!erodeXProc) {
+        erodeXProc = erode<kX>;
+    }
+    erodeXProc(src.getAddr32(0, 0), dst->getAddr32(0, 0),
+               radiusX, src.width(), src.height(),
+               src.rowBytesAsPixels(), dst->rowBytesAsPixels());
 }
 
 static void erodeY(const SkBitmap& src, SkBitmap* dst, int radiusY)
 {
-    erode(src.getAddr32(0, 0), dst->getAddr32(0, 0),
-          radiusY, src.height(), src.width(),
-          src.rowBytesAsPixels(), 1, dst->rowBytesAsPixels(), 1);
+    SkMorphologyProc erodeYProc = SkMorphologyGetPlatformProc(kErodeY_SkMorphologyProcType);
+    if (!erodeYProc) {
+        erodeYProc = erode<kY>;
+    }
+    erodeYProc(src.getAddr32(0, 0), dst->getAddr32(0, 0),
+               radiusY, src.height(), src.width(),
+               src.rowBytesAsPixels(), dst->rowBytesAsPixels());
 }
 
+template<MorphDirection direction>
 static void dilate(const SkPMColor* src, SkPMColor* dst,
                    int radius, int width, int height,
-                   int srcStrideX, int srcStrideY,
-                   int dstStrideX, int dstStrideY)
+                   int srcStride, int dstStride)
 {
-    radius = SkMin32(radius, width - 1);
-    const SkPMColor* upperSrc = src + radius * srcStrideX;
+    const int srcStrideX = direction == kX ? 1 : srcStride;
+    const int dstStrideX = direction == kX ? 1 : dstStride;
+    const int srcStrideY = direction == kX ? srcStride : 1;
+    const int dstStrideY = direction == kX ? dstStride : 1;
+    const SkPMColor* upperSrc = src + SkMin32(radius, width - 1) * srcStrideX;
     for (int x = 0; x < width; ++x) {
         const SkPMColor* lp = src;
         const SkPMColor* up = upperSrc;
@@ -121,16 +140,24 @@ static void dilate(const SkPMColor* src, SkPMColor* dst,
 
 static void dilateX(const SkBitmap& src, SkBitmap* dst, int radiusX)
 {
-    dilate(src.getAddr32(0, 0), dst->getAddr32(0, 0),
-           radiusX, src.width(), src.height(),
-           1, src.rowBytesAsPixels(), 1, dst->rowBytesAsPixels());
+    SkMorphologyProc dilateXProc = SkMorphologyGetPlatformProc(kDilateX_SkMorphologyProcType);
+    if (!dilateXProc) {
+        dilateXProc = dilate<kX>;
+    }
+    dilateXProc(src.getAddr32(0, 0), dst->getAddr32(0, 0),
+                radiusX, src.width(), src.height(),
+                src.rowBytesAsPixels(), dst->rowBytesAsPixels());
 }
 
 static void dilateY(const SkBitmap& src, SkBitmap* dst, int radiusY)
 {
-    dilate(src.getAddr32(0, 0), dst->getAddr32(0, 0),
-           radiusY, src.height(), src.width(),
-           src.rowBytesAsPixels(), 1, dst->rowBytesAsPixels(), 1);
+    SkMorphologyProc dilateYProc = SkMorphologyGetPlatformProc(kDilateY_SkMorphologyProcType);
+    if (!dilateYProc) {
+        dilateYProc = dilate<kY>;
+    }
+    dilateYProc(src.getAddr32(0, 0), dst->getAddr32(0, 0),
+                radiusY, src.height(), src.width(),
+                src.rowBytesAsPixels(), dst->rowBytesAsPixels());
 }
 
 bool SkErodeImageFilter::onFilterImage(Proxy* proxy,

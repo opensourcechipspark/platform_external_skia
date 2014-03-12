@@ -76,6 +76,7 @@ public:
         SkASSERT(false);
         return true;
     }
+    virtual bool markSupport();
 
     int8_t   readS8();
     int16_t  readS16();

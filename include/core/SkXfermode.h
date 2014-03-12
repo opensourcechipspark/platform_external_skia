@@ -234,6 +234,7 @@ protected:
     virtual SkPMColor xferColor(SkPMColor src, SkPMColor dst) const;
 
 private:
+	void* fProcSIMD;
     enum {
         kModeCount = kLastMode + 1
     };
